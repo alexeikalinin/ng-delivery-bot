@@ -60,6 +60,7 @@ ALLOWED_CHAT_IDS: set[int] = (
 
 _menu_cache: dict[str, tuple[float, any]] = {}
 CACHE_TTL = 3600  # 1 час
+_desc_cache: dict[str, str] = {}  # кеш описаний товаров
 
 
 def _get_cache(key: str):
@@ -326,34 +327,28 @@ def _extract_price(text: str) -> int:
 
 
 async def fetch_product_description(product_url: str) -> str:
-    """Загружает страницу товара и извлекает описание/состав."""
+    """Загружает страницу товара через Playwright и извлекает состав/описание."""
+    if product_url in _desc_cache:
+        return _desc_cache[product_url]
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(product_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status != 200:
-                    log.debug("fetch_product_description: status %d for %s", resp.status, product_url)
-                    return ""
-                html = await resp.text()
-        soup = BeautifulSoup(html, "html.parser")
-        # vkusnovmeste.by: <dt>Описание</dt><dd>...</dd>
-        for dt in soup.find_all("dt"):
-            if "описание" in dt.get_text().lower():
-                dd = dt.find_next_sibling("dd")
-                if dd:
-                    text = dd.get_text(" ", strip=True)
-                    if len(text) > 5:
-                        log.info("fetch_product_description: найдено '%s'", text[:60])
-                        return text
-        # Fallback: CSS классы
-        for sel in ["s-description", "product-description", "wb-product-description", "description"]:
-            el = soup.find(class_=sel)
-            if el:
-                text = el.get_text(" ", strip=True)
-                if len(text) > 5:
-                    return text
-        log.debug("fetch_product_description: описание не найдено на %s", product_url)
-        return ""
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(product_url, timeout=15000)
+            await page.wait_for_load_state("networkidle", timeout=8000)
+            import re as _re
+            page_text = await page.evaluate("() => document.body.innerText")
+            # Ищем текст после слова "Описание"
+            match = _re.search(r'Описание\s*\n+\s*(.+?)(?:\n|$)', page_text, _re.IGNORECASE)
+            description = match.group(1).strip() if match else ""
+            await browser.close()
+        if description:
+            log.info("fetch_product_description: '%s'", description[:80])
+            _desc_cache[product_url] = description
+        else:
+            log.info("fetch_product_description: описание не найдено на %s", product_url)
+            _desc_cache[product_url] = ""
+        return description
     except Exception as e:
         log.warning("fetch_product_description %s: %s", product_url, e)
         return ""
@@ -799,9 +794,11 @@ async def handle_dish_detail(callback: CallbackQuery, state: FSMContext) -> None
     price_str = f"{dish['price']//100}.{dish['price']%100:02d} р."
     # Загружаем описание с страницы товара
     product_url = dish.get("product_url")
+    log.info("dish detail: product_url=%s", product_url)
     description = ""
     if product_url:
         description = await fetch_product_description(product_url)
+        log.info("dish detail: description='%s'", description[:80] if description else "(пусто)")
     caption = f"*{dish['name']}*\n💰 {price_str}"
     if description:
         caption += f"\n\n_{description}_"
