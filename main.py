@@ -47,6 +47,15 @@ PHONE: str = os.getenv("PHONE", "")
 ADDRESS: str = os.getenv("ADDRESS", "")
 COMMENT: str = os.getenv("COMMENT", "Перезвонить для уточнения заказа")
 
+# Поля формы vkusnovmeste.by (адрес разбит на части)
+NAME: str = os.getenv("NAME", "")
+STREET: str = os.getenv("STREET", "")
+HOUSE: str = os.getenv("HOUSE", "")
+APARTMENT: str = os.getenv("APARTMENT", "")
+ENTRANCE: str = os.getenv("ENTRANCE", "")
+DELIVERY_TIME: str = os.getenv("DELIVERY_TIME", "")  # напр. "16.00.-17.00."
+DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
+
 _raw_ids = os.getenv("ALLOWED_CHAT_IDS", "")
 ALLOWED_CHAT_IDS: set[int] = (
     {int(x.strip()) for x in _raw_ids.split(",") if x.strip()}
@@ -386,43 +395,111 @@ async def place_order(chat_id: int, restaurant_name: str) -> Optional[bytes]:
 async def _order_vkusnovmeste(browser, cart: dict) -> bytes:
     page = await browser.new_page()
     await page.goto("https://vkusnovmeste.by/", timeout=30000)
+    await page.wait_for_load_state("networkidle", timeout=20000)
     await page.wait_for_timeout(2000)
 
     for dish_name in cart:
         qty = cart[dish_name]["qty"]
         for _ in range(qty):
             try:
-                # Ищем блюдо по тексту
                 el = page.get_by_text(dish_name, exact=False).first
                 await el.scroll_into_view_if_needed()
                 await page.wait_for_timeout(500)
 
-                # Кнопка «Добавить» рядом с блюдом
-                parent = await el.evaluate_handle("el => el.closest('.product, .dish, article, .item') || el.parentElement")
-                btn = await parent.query_selector("button")
+                parent = await el.evaluate_handle("el => el.closest('.wb-store-item') || el.parentElement")
+                btn = await parent.query_selector("button.wb-store-item-add-to-cart, button")
                 if btn:
                     await btn.click()
                 else:
-                    await page.get_by_role("button", name="Добавить").first.click()
+                    await page.get_by_role("button", name="добавить").first.click()
                 await page.wait_for_timeout(1000)
             except Exception as e:
                 log.warning("Не удалось добавить '%s': %s", dish_name, e)
 
-    # Переход в корзину
+    # Переход в корзину через элемент с классом cart
     try:
-        cart_btn = page.get_by_role("link", name="Корзина")
-        if not await cart_btn.count():
-            cart_btn = page.get_by_text("Корзина").first
-        await cart_btn.click()
+        await page.locator("[class*='cart']").first.click()
         await page.wait_for_timeout(2000)
     except Exception as e:
-        log.warning("Не удалось перейти в корзину: %s", e)
+        log.warning("Клик по корзине не удался (%s), переходим напрямую", e)
+        await page.goto("https://vkusnovmeste.by/wb_cart", timeout=15000)
+        await page.wait_for_timeout(2000)
 
-    # Заполнение формы
-    await _fill_order_form(page)
+    # Нажимаем «оформить заказ» — открывает форму с полями
+    try:
+        order_btn = page.get_by_role("button", name="оформить заказ")
+        if not await order_btn.count():
+            order_btn = page.locator("button.store-btn")
+        await order_btn.click()
+        await page.wait_for_timeout(2000)
+    except Exception as e:
+        log.warning("Кнопка 'оформить заказ': %s", e)
+
+    await _fill_order_form_vkusno(page)
 
     screenshot = await page.screenshot(full_page=True)
     return screenshot
+
+
+async def _fill_order_form_vkusno(page) -> None:
+    """Заполняет форму заказа на vkusnovmeste.by по именам полей wb_input_*."""
+    await page.wait_for_timeout(1000)
+
+    field_map = {
+        "wb_input_0": NAME,
+        "wb_input_1": PHONE,
+        "wb_input_2": STREET,
+        "wb_input_3": HOUSE,
+        "wb_input_4": APARTMENT,
+        "wb_input_5": ENTRANCE,
+        "wb_input_6": COMMENT,
+    }
+    for field_name, value in field_map.items():
+        if not value:
+            continue
+        try:
+            el = page.locator(f"[name='{field_name}']")
+            if await el.count():
+                await el.fill(value)
+                await page.wait_for_timeout(200)
+        except Exception as e:
+            log.warning("vkusno form: %s → %s", field_name, e)
+
+    # Оплата наличными
+    try:
+        await page.select_option("[name='wb_input_8']", value="Оплата наличными")
+    except Exception as e:
+        log.warning("Оплата: %s", e)
+
+    # Время доставки — первый доступный слот (или из .env)
+    try:
+        sel = page.locator("[name='wb_input_7']")
+        if await sel.count():
+            options = await sel.evaluate(
+                "el => [...el.options].map(o => o.value)"
+                ".filter(v => v !== 'Предпочтительное время доставки')"
+            )
+            if options:
+                target = DELIVERY_TIME if DELIVERY_TIME in options else options[0]
+                await page.select_option("[name='wb_input_7']", value=target)
+    except Exception as e:
+        log.warning("Время доставки: %s", e)
+
+    await page.wait_for_timeout(500)
+
+    if DRY_RUN:
+        log.info("DRY_RUN: пропускаем отправку заказа, делаем скриншот формы")
+        return
+
+    # Кнопка «заказать»
+    try:
+        submit = page.get_by_role("button", name="заказать")
+        if not await submit.count():
+            submit = page.locator("button.btn-success").last
+        await submit.click()
+        await page.wait_for_timeout(3000)
+    except Exception as e:
+        log.warning("Кнопка 'заказать': %s", e)
 
 
 async def _order_sadypobedy(browser, cart: dict) -> bytes:
@@ -501,6 +578,10 @@ async def _fill_order_form(page) -> None:
         pass
 
     await page.wait_for_timeout(500)
+
+    if DRY_RUN:
+        log.info("DRY_RUN: пропускаем отправку заказа, делаем скриншот формы")
+        return
 
     # Кнопка отправки заказа
     submit_options = [
